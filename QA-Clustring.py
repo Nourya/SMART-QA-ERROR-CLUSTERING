@@ -1,20 +1,36 @@
 import streamlit as st
 import xml.etree.ElementTree as ET
 import re
+import pandas as pd
+import io
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.cluster import KMeans
-import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill
+from openpyxl.utils import get_column_letter
 
-st.title("📊 Analyse intelligente des erreurs QA (Robot Framework)")
+st.set_page_config(page_title="Analyse Robot Framework", layout="wide")
+st.title("🤖 Analyse intelligente des erreurs Robot Framework")
 
-uploaded_file = st.file_uploader("Choisis ton fichier output.xml", type="xml")
+uploaded_file = st.file_uploader("📂 Téléverse ton fichier `output.xml`", type="xml")
 
-def extract_failures(root):
-    failures = []
-    for status in root.findall(".//status[@status='FAIL']"):
-        if status.text and status.text.strip():
-            failures.append(status.text.strip())
-    return failures
+# Extraction & nettoyage
+def extract_failed_tests(root):
+    failed_tests = []
+    for test in root.findall(".//test"):
+        test_name = test.attrib.get("name", "Test inconnu")
+        status = test.find("status")
+        if status is not None and status.attrib.get("status") == "FAIL":
+            errors = []
+            for msg in test.findall(".//kw/status[@status='FAIL']"):
+                if msg.text and msg.text.strip():
+                    errors.append(msg.text.strip())
+            if errors:
+                failed_tests.append({
+                    "test_name": test_name,
+                    "errors": errors
+                })
+    return failed_tests
 
 def clean_text(text):
     text = text.lower()
@@ -31,37 +47,88 @@ if uploaded_file:
     tree = ET.parse(uploaded_file)
     root = tree.getroot()
 
-    failures = extract_failures(root)
-    cleaned = [clean_text(f) for f in failures]
+    all_tests = root.findall(".//test")
+    total_tests = len(all_tests)
+    failed_tests_data = extract_failed_tests(root)
+    failed_count = len(failed_tests_data)
+    passed_count = total_tests - failed_count
 
-    if failures:
+    st.markdown(f"✅ **Total tests : {total_tests}** | 🟢 Réussis : {passed_count} | 🔴 Échoués : {failed_count}")
+
+    if failed_tests_data:
+        st.subheader("📌 Détails des tests échoués")
+        full_errors = []
+        for test in failed_tests_data:
+            st.markdown(f"### ❌ {test['test_name']}")
+            for idx, error in enumerate(test['errors'], 1):
+                st.markdown(f"- **Erreur {idx}** : {simplify_message(error)}")
+                full_errors.append({
+                    "Test": test["test_name"],
+                    "Erreur complète": error,
+                    "Erreur simplifiée": simplify_message(error)
+                })
+
+        # Clustering des erreurs
+        cleaned = [clean_text(e["Erreur complète"]) for e in full_errors]
         vectorizer = TfidfVectorizer()
         X = vectorizer.fit_transform(cleaned)
-        n_clusters = min(3, len(failures))
+        n_clusters = min(3, len(full_errors))
         kmeans = KMeans(n_clusters=n_clusters, random_state=42)
         kmeans.fit(X)
 
-        grouped = {}
         for i, label in enumerate(kmeans.labels_):
-            grouped.setdefault(label, []).append(failures[i])
+            full_errors[i]["Groupe"] = f"Groupe {label+1}"
 
-        st.success(f"{len(failures)} erreurs détectées.")
-        for label, msgs in grouped.items():
-            st.subheader(f"🧠 Groupe {label+1} ({len(msgs)} erreurs)")
-            for i, m in enumerate(msgs, 1):
-                st.markdown(f"**{i}.** {simplify_message(m)}")
+        st.subheader("🧠 Regroupement des erreurs similaires (clustering)")
+        grouped = {}
+        for e in full_errors:
+            grouped.setdefault(e["Groupe"], []).append(e)
 
-        # Export CSV
-        data = []
-        for label, msgs in grouped.items():
-            for msg in msgs:
-                data.append({
-                    "Groupe": f"Groupe {label+1}",
-                    "Erreur simplifiée": simplify_message(msg),
-                    "Erreur complète": msg
-                })
-        df = pd.DataFrame(data)
-        csv = df.to_csv(index=False).encode('utf-8')
-        st.download_button("📥 Télécharger CSV", csv, "grouped_errors.csv", "text/csv")
+        for group, messages in grouped.items():
+            st.markdown(f"### 🧠 {group} ({len(messages)} erreurs)")
+            for i, msg in enumerate(messages, 1):
+                st.markdown(f"**{i}.** *{msg['Erreur simplifiée']}*")
+
+        # Génération Excel
+        st.subheader("📥 Export Excel structuré & stylé")
+        df = pd.DataFrame(full_errors)
+
+        output = io.BytesIO()
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Erreurs groupées"
+
+        headers = list(df.columns)
+        ws.append(headers)
+
+        # Styles
+        header_font = Font(bold=True, color="FFFFFF")
+        header_fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
+        group_colors = ["DCE6F1", "E2EFDA", "FCE4D6", "F9D5E5"]
+
+        for col_num, col_title in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col_num)
+            cell.font = header_font
+            cell.fill = header_fill
+            col_letter = get_column_letter(col_num)
+            ws.column_dimensions[col_letter].width = 30
+
+        for i, row in df.iterrows():
+            group_num = int(re.search(r'\d+', row["Groupe"]).group())
+            fill_color = group_colors[(group_num - 1) % len(group_colors)]
+            for j, val in enumerate(row, 1):
+                cell = ws.cell(row=i+2, column=j, value=val)
+                cell.fill = PatternFill(start_color=fill_color, end_color=fill_color, fill_type="solid")
+
+        wb.save(output)
+        output.seek(0)
+
+        st.download_button(
+            label="📊 Télécharger Excel structuré (.xlsx)",
+            data=output,
+            file_name="erreurs_robot_framework.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
     else:
-        st.warning("Aucune erreur détectée dans le fichier.")
+        st.info("Aucune erreur détectée dans le fichier. Bravo ! 🎉")
